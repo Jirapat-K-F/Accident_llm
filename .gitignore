@@ -1,0 +1,14 @@
+/res
+/summary_data
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+/.deepeval
+/.env
+/main.py
+/summary*
+/Eval.py
+/top*
+/feed_db.py
