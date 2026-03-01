@@ -1,5 +1,6 @@
 import csv
 import chromadb
+import glob
 from docx import Document
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
@@ -122,7 +123,8 @@ class Pipeline:
             "similar_cases": similar_cases_context
         })   
 
-    def predict(self, val_file_path : str, gt_file_path : str) -> str:
+    def predict(self, val_file_path : str, gt_file_path : str) -> dict:
+        """Process a single validation file"""
         results = {}
         val_content = self.reader.read(val_file_path)
         val_summary = self.indexing.summarize_with_llm(val_content)
@@ -153,29 +155,119 @@ class Pipeline:
         results['val'] = os.path.basename(val_file_path)
         results['TopK'] = '\n'.join([f"{file['rank']}. {file['filename']} (similarity: {file['similarity_score']})" for file in similar_files])
         results['results'] = prediction
-        self.write_to_csv(results, os.path.join("res/eval", f"validate_results.csv"), eval=evaluation_results)
+        results['evaluation'] = evaluation_results
+        
+        # Write single file result
+        self.write_to_csv([results], os.path.join("res/eval", f"single_file_results.csv"))
         return results
+    
+    def predict_folder(self, val_folder_path: str, gt_folder_path: str) -> list:
+        """Process all validation files in a folder and return consolidated results"""
+        print(f"\n=== Processing folder: {val_folder_path} ===")
+        
+        # Get all .docx files from validation folder
+        val_files = [f for f in os.listdir(val_folder_path) if f.endswith('.docx')]
+        
+        if not val_files:
+            print("No .docx files found in validation folder")
+            return []
+        
+        all_results = []
+        
+        for i, val_file in enumerate(val_files[:5], 1):
+            print(f"\n--- Processing file {i}/{len(val_files)}: {val_file} ---")
+            
+            val_file_path = os.path.join(val_folder_path, val_file)
+            gt_file_path = os.path.join(gt_folder_path, val_file)
+            
+            # Check if corresponding GT file exists
+            if not os.path.exists(gt_file_path):
+                print(f"Warning: GT file not found for {val_file}, skipping...")
+                continue
+            
+            try:
+                # Process single file (without writing individual CSV)
+                val_content = self.reader.read(val_file_path)
+                val_summary = self.indexing.summarize_with_llm(val_content)
+                
+                similar_files = self.find_top_k(val_summary)
+                full_documents = self.get_full_documents(similar_files)
+                
+                similar_cases_context = "\n\n".join(full_documents.values())
+                prediction = self.get_prediction(val_content, similar_cases_context)
+                
+                gt = self.reader.read(gt_file_path)
+                
+                # Run evaluation
+                if self.enable_evaluation and self.local_judge is not None:
+                    evaluation_results = self.evaluate(prediction, gt, list(full_documents.values()))
+                else:
+                    evaluation_results = {
+                        "AnswerRelevancy": {"score": "Disabled", "reason": "Evaluation was disabled"},
+                        "ContextualPrecision": {"score": "Disabled", "reason": "Evaluation was disabled"},
+                        "ContextualRecall": {"score": "Disabled", "reason": "Evaluation was disabled"}, 
+                        "ContextualRelevancy": {"score": "Disabled", "reason": "Evaluation was disabled"}
+                    }
+                
+                # Store results
+                result = {
+                    'val': val_file,
+                    'TopK': '\n'.join([f"{file['rank']}. {file['filename']} (similarity: {file['similarity_score']})" for file in similar_files]),
+                    'results': prediction,
+                    'evaluation': evaluation_results
+                }
+                
+                all_results.append(result)
+                print(f"✓ Successfully processed {val_file}")
+                
+            except Exception as e:
+                print(f"✗ Error processing {val_file}: {e}")
+                continue
+        
+        # Write consolidated CSV for all files
+        if all_results:
+            output_csv = os.path.join("res/eval", "folder_validation_results.csv")
+            self.write_to_csv(all_results, output_csv)
+            print(f"\n✓ Processed {len(all_results)} files successfully")
+            print(f"✓ Consolidated results saved to {output_csv}")
+        
+        return all_results
 
-    def write_to_csv(self, results: dict, csv_filename: str, eval: dict = None):
+    def write_to_csv(self, results_list: list, csv_filename: str):
+        """Write results to CSV - handles both single result and multiple results"""
+        
+        # Ensure results_list is always a list
+        if isinstance(results_list, dict):
+            results_list = [results_list]
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+        
         with open(csv_filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["validate", "TopK", "results", "AnswerRelevancy", "ContextualPrecision", "ContextualRecall", "ContextualRelevancy"])
             
             # Helper function to safely get score and reason
-            def get_metric_info(metric_name):
-                if eval and metric_name in eval:
-                    score = eval[metric_name].get("score", "N/A")
-                    reason = eval[metric_name].get("reason", eval[metric_name].get("error", "No reason provided"))
+            def get_metric_info(eval_dict, metric_name):
+                if eval_dict and metric_name in eval_dict:
+                    score = eval_dict[metric_name].get("score", "N/A")
+                    reason = eval_dict[metric_name].get("reason", eval_dict[metric_name].get("error", "No reason provided"))
                     return f"{score}\n{reason}"
                 return "N/A\nEvaluation not available"
             
-            writer.writerow([
-                results["val"], results["TopK"], results["results"], 
-                get_metric_info("AnswerRelevancy"),
-                get_metric_info("ContextualPrecision"),
-                get_metric_info("ContextualRecall"),
-                get_metric_info("ContextualRelevancy")
+            # Write each result as a row
+            for result in results_list:
+                eval_data = result.get('evaluation', {})
+                writer.writerow([
+                    result["val"], 
+                    result["TopK"], 
+                    result["results"], 
+                    get_metric_info(eval_data, "AnswerRelevancy"),
+                    get_metric_info(eval_data, "ContextualPrecision"),
+                    get_metric_info(eval_data, "ContextualRecall"),
+                    get_metric_info(eval_data, "ContextualRelevancy")
                 ])
+                
         print(f"Results saved to {csv_filename}")
 
     def evaluate(self, predicted_measures: str, val_content: str, top_k: list[str]) -> dict:
@@ -285,12 +377,16 @@ class Pipeline:
 if __name__ == "__main__":
     # Configuration
     CHROMA_DB_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/DataPrep/res/database"
-    # CHROMA_DB_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/DataPrep/res/summary_data/sum_llama3/chroma_db"
     FULL_DOCS_DIRECTORY = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/train/"
+    
+    # Paths for single file processing
     VAL_FILE_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_wo_measurement/2025-05-30 รายงานสืบสวนอุบัติเหตุเชิงลึก_RUTS-250101-08.docx"
-    # VAL_FILE_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_wo_measurement/2025-06-28 รายงานสืบสวนอุบัติเหตุเชิงลึก_RUTS-250519-13.docx"
-    # VAL_FILE_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_wo_measurement/2025-04-16 รายงานสืบสวนอุบัติเหตุเชิงลึก_NO-250101-01.docx"
-    GT_file_path = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_measurement_only/2025-05-30 รายงานสืบสวนอุบัติเหตุเชิงลึก_RUTS-250101-08.docx"
+    GT_FILE_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_measurement_only/2025-05-30 รายงานสืบสวนอุบัติเหตุเชิงลึก_RUTS-250101-08.docx"
+    
+    # Paths for folder processing
+    VAL_FOLDER_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_wo_measurement/"
+    GT_FOLDER_PATH = "C:/Users/User/Desktop/chula/Year3/indiv_ai_agent/dataset/valid_measurement_only/"
+    
     K = 5  # Number of similar documents to retrieve
     
     # Initialize pipeline
@@ -299,11 +395,21 @@ if __name__ == "__main__":
         full_docs_directory=FULL_DOCS_DIRECTORY,
         k=K,
         enable_evaluation=True  # Set to False to skip evaluation if you encounter timeout issues
-        # collection_name="summary_comparison"
     )
     
-    # Run pipeline
-    results = pipeline.predict(VAL_FILE_PATH, GT_file_path)
-    # print("Prediction Results:")
-    # print(results)
+    # Choose processing mode
+    PROCESS_MODE = "folder"  # Change to "single" for single file processing
+    
+    if PROCESS_MODE == "single":
+        print("=== Single File Processing ===")
+        results = pipeline.predict(VAL_FILE_PATH, GT_FILE_PATH)
+        print("✓ Single file processing completed")
+        
+    elif PROCESS_MODE == "folder":
+        print("=== Folder Processing ===")
+        results = pipeline.predict_folder(VAL_FOLDER_PATH, GT_FOLDER_PATH)
+        print(f"✓ Folder processing completed - {len(results)} files processed")
+    
+    else:
+        print("Invalid PROCESS_MODE. Use 'single' or 'folder'")
 
